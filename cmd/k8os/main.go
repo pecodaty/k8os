@@ -82,5 +82,26 @@ func newRoot() *cobra.Command {
 	}}
 	cleanup.Flags().StringVar(&namespace, "k8os-namespace", chaos.DefaultNamespace, "namespace owned by k8os")
 	root.AddCommand(cleanup)
+	heal := &cobra.Command{Use: "heal", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
+		config, err := rest.InClusterConfig()
+		if err != nil {
+			config, err = clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile)
+		}
+		if err != nil {
+			return fmt.Errorf("load Kubernetes configuration: %w", err)
+		}
+		client, err := dynamic.NewForConfig(config)
+		if err != nil {
+			return err
+		}
+		count, err := chaos.Heal(cmd.Context(), client, namespace)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(cmd.OutOrStdout(), "healed %d k8os resources in namespace %s\n", count, namespace)
+		return err
+	}}
+	heal.Flags().StringVar(&namespace, "k8os-namespace", chaos.DefaultNamespace, "namespace owned by k8os")
+	root.AddCommand(heal)
 	return root
 }

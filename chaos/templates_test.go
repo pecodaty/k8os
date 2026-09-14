@@ -6,7 +6,9 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/fake"
 )
 
@@ -54,7 +56,7 @@ func TestCleanupOnlyDeletesOwnedResourcesInNamespace(t *testing.T) {
 	foreign := owned.DeepCopy()
 	foreign.SetName("foreign")
 	foreign.SetLabels(map[string]string{"app.kubernetes.io/name": "other"})
-	client := fake.NewSimpleDynamicClientWithCustomListKinds(nil, map[schema.GroupVersionResource]string{{Group: "", Version: "v1", Resource: "configmaps"}: "ConfigMapList"}, owned, foreign)
+	client := fake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), cleanupListKinds(), owned, foreign)
 	count, err := Cleanup(context.Background(), client, "k8os")
 	if err != nil {
 		t.Fatal(err)
@@ -69,4 +71,78 @@ func TestCleanupOnlyDeletesOwnedResourcesInNamespace(t *testing.T) {
 	if len(remaining.Items) != 1 || remaining.Items[0].GetName() != "foreign" {
 		t.Fatalf("remaining resources = %#v", remaining.Items)
 	}
+}
+
+func TestCleanupDeletesJobsWithBackgroundPropagation(t *testing.T) {
+	job := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "batch/v1",
+		"kind":       "Job",
+		"metadata": map[string]interface{}{
+			"name":      "owned-job",
+			"namespace": "k8os",
+			"labels": map[string]interface{}{
+				"app.kubernetes.io/name":       "k8os",
+				"app.kubernetes.io/managed-by": "k8os",
+			},
+		},
+	}}
+	client := &recordingDynamicClient{Interface: fake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), cleanupListKinds(), job)}
+
+	if _, err := Cleanup(context.Background(), client, "k8os"); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(client.deleteOptions) != 1 {
+		t.Fatalf("delete calls = %d, want 1", len(client.deleteOptions))
+	}
+	options := client.deleteOptions[0]
+	if options.PropagationPolicy == nil {
+		t.Fatal("job delete propagation policy is nil")
+	}
+	if *options.PropagationPolicy != metav1.DeletePropagationBackground {
+		t.Fatalf("job delete propagation policy = %q, want %q", *options.PropagationPolicy, metav1.DeletePropagationBackground)
+	}
+}
+
+func cleanupListKinds() map[schema.GroupVersionResource]string {
+	listKinds := make(map[schema.GroupVersionResource]string, len(resources))
+	for kind, resourceName := range resources {
+		group, version := apiForKind(kind)
+		listKinds[schema.GroupVersionResource{Group: group, Version: version, Resource: resourceName}] = kind + "List"
+	}
+	return listKinds
+}
+
+type recordingDynamicClient struct {
+	dynamic.Interface
+	deleteOptions []metav1.DeleteOptions
+}
+
+func (c *recordingDynamicClient) Resource(gvr schema.GroupVersionResource) dynamic.NamespaceableResourceInterface {
+	return &recordingResourceInterface{
+		NamespaceableResourceInterface: c.Interface.Resource(gvr),
+		recorder:                       c,
+	}
+}
+
+type recordingResourceInterface struct {
+	dynamic.NamespaceableResourceInterface
+	recorder *recordingDynamicClient
+}
+
+func (r *recordingResourceInterface) Namespace(namespace string) dynamic.ResourceInterface {
+	return &recordingNamespacedResourceInterface{
+		ResourceInterface: r.NamespaceableResourceInterface.Namespace(namespace),
+		recorder:          r.recorder,
+	}
+}
+
+type recordingNamespacedResourceInterface struct {
+	dynamic.ResourceInterface
+	recorder *recordingDynamicClient
+}
+
+func (r *recordingNamespacedResourceInterface) Delete(ctx context.Context, name string, options metav1.DeleteOptions, subresources ...string) error {
+	r.recorder.deleteOptions = append(r.recorder.deleteOptions, options)
+	return r.ResourceInterface.Delete(ctx, name, options, subresources...)
 }
