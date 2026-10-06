@@ -64,7 +64,7 @@ The Kind check creates a temporary cluster by default. Set `KIND_CLUSTER=<existi
 Other Go modules can depend on this repository and import its public packages:
 
 ```bash
-go get github.com/pecodaty/k8os@v0.1.0
+go get github.com/pecodaty/k8os@v0.1.1
 ```
 
 ```go
@@ -78,11 +78,15 @@ The `cmd/k8os` and `cmd/incident-fixture` directories are commands, not importab
 
 ## Releasing
 
-After committing changes to `main`, create and push a new semantic version tag:
+After committing changes to `main`, create and push a new semantic version tag. For example:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
 The GitHub Actions workflow tests pushes and pull requests. A version tag triggers the same checks, creates a GitHub release, and asks the public Go proxy to index the module. The repository must be public for unauthenticated `go get` and proxy indexing. Use a new tag for each release; Go module versions must not be moved after publication.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
