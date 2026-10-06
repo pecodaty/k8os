@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -14,6 +15,7 @@ import (
 
 var resources = map[string]string{
 	"Pod": "pods", "Deployment": "deployments", "ReplicaSet": "replicasets", "DaemonSet": "daemonsets", "StatefulSet": "statefulsets", "Job": "jobs", "CronJob": "cronjobs", "Service": "services", "ConfigMap": "configmaps", "Secret": "secrets", "PersistentVolumeClaim": "persistentvolumeclaims", "Ingress": "ingresses", "ServiceAccount": "serviceaccounts", "Role": "roles", "RoleBinding": "rolebindings",
+	"PodDisruptionBudget": "poddisruptionbudgets", "ValidatingWebhookConfiguration": "validatingwebhookconfigurations",
 }
 
 // Creator is the only Kubernetes operation needed by the injector.
@@ -29,6 +31,9 @@ func Heal(ctx context.Context, client dynamic.Interface, namespace string) (int,
 	selector := "app.kubernetes.io/name=k8os,app.kubernetes.io/managed-by=k8os"
 	healed := 0
 	for kind, resourceName := range resources {
+		if healthySpec(kind) == nil || clusterScoped[kind] {
+			continue
+		}
 		group, version := apiForKind(kind)
 		resource := client.Resource(schema.GroupVersionResource{Group: group, Version: version, Resource: resourceName}).Namespace(namespace)
 		list, err := resource.List(ctx, metav1.ListOptions{LabelSelector: selector})
@@ -44,13 +49,56 @@ func Heal(ctx context.Context, client dynamic.Interface, namespace string) (int,
 			}
 			labels["k8os.io/healed"] = "true"
 			obj.SetLabels(labels)
-			if _, err := resource.Update(ctx, obj, metav1.UpdateOptions{}); err != nil {
+			_, err := resource.Update(ctx, obj, metav1.UpdateOptions{})
+			if apierrors.IsInvalid(err) {
+				// A Job's template, a Pod's spec, a claim's request are
+				// immutable: the only way to a healthy object is a new one
+				// under the same name.
+				err = recreate(ctx, resource, obj)
+			}
+			if err != nil {
 				return healed, fmt.Errorf("heal %s/%s: %w", kind, obj.GetName(), err)
 			}
 			healed++
 		}
 	}
 	return healed, nil
+}
+
+// recreate replaces an object whose spec cannot be updated in place.
+func recreate(ctx context.Context, resource dynamic.ResourceInterface, obj *unstructured.Unstructured) error {
+	propagationPolicy := metav1.DeletePropagationForeground
+	if err := resource.Delete(ctx, obj.GetName(), metav1.DeleteOptions{PropagationPolicy: &propagationPolicy}); err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	fresh := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": obj.GetAPIVersion(), "kind": obj.GetKind(),
+		"metadata": map[string]interface{}{"name": obj.GetName(), "namespace": obj.GetNamespace(), "labels": stringMap(obj.GetLabels())},
+		"spec":     obj.Object["spec"],
+	}}
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		_, err := resource.Create(ctx, fresh, metav1.CreateOptions{})
+		if err == nil {
+			return nil
+		}
+		if !apierrors.IsAlreadyExists(err) || time.Now().After(deadline) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+func stringMap(values map[string]string) map[string]interface{} {
+	out := make(map[string]interface{}, len(values))
+	for key, value := range values {
+		out[key] = value
+	}
+	return out
 }
 
 func healthySpec(kind string) map[string]interface{} {
@@ -100,8 +148,13 @@ func Cleanup(ctx context.Context, client dynamic.Interface, namespace string) (i
 	deleted := 0
 	for kind, resourceName := range resources {
 		group, version := apiForKind(kind)
-		resource := client.Resource(schema.GroupVersionResource{Group: group, Version: version, Resource: resourceName}).Namespace(namespace)
-		list, err := resource.List(ctx, metav1.ListOptions{LabelSelector: selector})
+		var resource dynamic.ResourceInterface = client.Resource(schema.GroupVersionResource{Group: group, Version: version, Resource: resourceName}).Namespace(namespace)
+		kindSelector := selector
+		if clusterScoped[kind] {
+			resource = client.Resource(schema.GroupVersionResource{Group: group, Version: version, Resource: resourceName})
+			kindSelector += ",k8os.io/namespace=" + namespace
+		}
+		list, err := resource.List(ctx, metav1.ListOptions{LabelSelector: kindSelector})
 		if err != nil {
 			return deleted, fmt.Errorf("list %s: %w", resourceName, err)
 		}
@@ -125,6 +178,10 @@ func apiForKind(kind string) (string, string) {
 		return "networking.k8s.io", "v1"
 	case "Role", "RoleBinding":
 		return "rbac.authorization.k8s.io", "v1"
+	case "PodDisruptionBudget":
+		return "policy", "v1"
+	case "ValidatingWebhookConfiguration":
+		return "admissionregistration.k8s.io", "v1"
 	default:
 		return "", "v1"
 	}
@@ -142,6 +199,10 @@ func (c dynamicCreator) Create(ctx context.Context, obj *unstructured.Unstructur
 	}
 	group, version := apiForKind(obj.GetKind())
 	resource := c.client.Resource(schema.GroupVersionResource{Group: group, Version: version, Resource: gvr})
+	if clusterScoped[obj.GetKind()] {
+		_, err := resource.Create(ctx, obj, metav1.CreateOptions{})
+		return err
+	}
 	_, err := resource.Namespace(c.namespace).Create(ctx, obj, metav1.CreateOptions{})
 	return err
 }

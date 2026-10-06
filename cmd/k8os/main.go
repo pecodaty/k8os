@@ -103,5 +103,6 @@ func newRoot() *cobra.Command {
 	}}
 	heal.Flags().StringVar(&namespace, "k8os-namespace", chaos.DefaultNamespace, "namespace owned by k8os")
 	root.AddCommand(heal)
+	root.AddCommand(newScenarioCommand())
 	return root
 }
