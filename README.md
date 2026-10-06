@@ -58,3 +58,31 @@ go test ./...
 ```
 
 The Kind check creates a temporary cluster by default. Set `KIND_CLUSTER=<existing-kind-cluster>` to use an existing cluster; the check then creates and removes its `k8os-upstream-test` namespace.
+
+## Using the Go packages
+
+Other Go modules can depend on this repository and import its public packages:
+
+```bash
+go get github.com/pecodaty/k8os@v0.1.0
+```
+
+```go
+import (
+    "github.com/pecodaty/k8os/chaos"
+    "github.com/pecodaty/k8os/scenario"
+)
+```
+
+The `cmd/k8os` and `cmd/incident-fixture` directories are commands, not importable packages.
+
+## Releasing
+
+After committing changes to `main`, create and push a new semantic version tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The GitHub Actions workflow tests pushes and pull requests. A version tag triggers the same checks, creates a GitHub release, and asks the public Go proxy to index the module. The repository must be public for unauthenticated `go get` and proxy indexing. Use a new tag for each release; Go module versions must not be moved after publication.
